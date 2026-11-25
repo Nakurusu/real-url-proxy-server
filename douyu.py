@@ -1,151 +1,165 @@
-# 获取斗鱼直播间的真实流媒体地址，默认最高画质
+# 获取斗鱼直播间的真实流媒体地址（PC 网页版 getH5PlayV1 接口）
+#
+# 与原仓库 real-url-proxy-server 里的 douyu.py 接口兼容：
+#   DouYu('房间号').get_real_url()  ->  dict
+#   dict['flv']  = 当前可得的最高画质
+#   dict['4000'] = 蓝光4M，dict['2000'] = 超清，dict['900'] = 高清
+#   兼容旧键：dict['2000p'] / dict['900p']
+#
+# Cookie（决定能不能拿到「原画/蓝光8M」）按以下优先级自动加载：
+#   1. DouYu(rid, cookie='...') 显式传入
+#   2. 环境变量 DOUYU_COOKIE
+#   3. cookie 文件（环境变量 DOUYU_COOKIE_FILE，或同目录 douyu_cookie.txt）
+#   用 douyu_cookie.py 可以从本机浏览器里把 cookie 取出来。
+#
+# 旧的 m.douyu.com/ratestream、hlsH5Preview 接口最高只到 2000kbps（720p 超清），已弃用。
 import hashlib
+import os
 import re
 import time
+from email.utils import parsedate_to_datetime
 
 import requests
 
-try:
-    import quickjs
-    use_quickjs = True
-except ImportError:
-    import execjs
-    use_quickjs = False
+HERE = os.path.dirname(os.path.abspath(__file__))
+DOUYU_COOKIE_FILE = os.environ.get('DOUYU_COOKIE_FILE') or os.path.join(HERE, 'douyu_cookie.txt')
+
+UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
+      '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36')
+
+
+def load_cookie(path=None):
+    path = path or DOUYU_COOKIE_FILE
+    if path and os.path.isfile(path):
+        with open(path) as f:
+            return f.read().strip()
+    return ''
+
+
+def resolve_cookie(path=None):
+    """优先级：DOUYU_COOKIE 环境变量 > cookie 文件。"""
+    return os.environ.get('DOUYU_COOKIE', '').strip() or load_cookie(path)
 
 
 class DouYu:
-    def __init__(self, rid):
-        """
-        房间号通常为1~8位纯数字，浏览器地址栏中看到的房间号不一定是真实rid.
-        Args:
-            rid:
-        """
-        self.did = '10000000000000000000000000001501'
+    URL_ENCRYPTION = 'https://www.douyu.com/wgapi/livenc/liveweb/websec/getEncryption'
+    URL_PLAY = 'https://www.douyu.com/lapi/live/getH5PlayV1/{}'
+    URL_BETARD = 'https://www.douyu.com/betard/{}'
+    DID = '10000000000000000000000000001501'
 
+    def __init__(self, rid, cookie=None, hevc=None):
         self.s = requests.Session()
-        self.res = self.s.get('https://m.douyu.com/' + str(rid), timeout=30).text
-        result = re.search(r'rid":(\d{1,8}),"vipId', self.res)
+        self.s.headers.update({
+            'User-Agent': UA,
+            'Referer': 'https://www.douyu.com/',
+            'Accept': 'application/json, text/plain, */*',
+        })
+        self.cookie = resolve_cookie() if cookie is None else cookie
+        if self.cookie:
+            self.s.headers['Cookie'] = self.cookie
+        # hevc=1 请求 H.265（部分房间的 2K/4K 原画只有 H.265 版本）
+        self.hevc = os.environ.get('DOUYU_HEVC', '0') if hevc is None else str(hevc)
+        self.rid = self._resolve_rid(rid)
 
-        if result:
-            self.rid = result.group(1)
-        else:
+    # ---------- 房间号 -> 真实 rid ----------
+    def _resolve_rid(self, rid):
+        try:
+            data = self.s.get(self.URL_BETARD.format(rid), timeout=30).json()
+            return str(data['room']['room_id'])
+        except Exception:
+            res = self.s.get('https://m.douyu.com/{}'.format(rid), timeout=30).text
+            m = re.search(r'rid":(\d{1,8}),"vipId', res)
+            if m:
+                return m.group(1)
             raise Exception('房间号错误')
 
+    # ---------- 签名 ----------
     @staticmethod
-    def md5(data):
-        return hashlib.md5(data.encode('utf-8')).hexdigest()
+    def _md5(s):
+        return hashlib.md5(s.encode('utf-8')).hexdigest()
 
-    def get_pre(self):
-        url = 'https://playweb.douyucdn.cn/lapi/live/hlsH5Preview/' + self.rid
-        data = {
-            'rid': self.rid,
-            'did': self.did
-        }
-        t13 = str(int((time.time() * 1000)))
-        auth = DouYu.md5(self.rid + t13)
-        headers = {
-            'rid': self.rid,
-            'time': t13,
-            'auth': auth
-        }
-        res = self.s.post(url, headers=headers, data=data, timeout=30).json()
-        error = res['error']
-        data = res['data']
-        key = ''
-        url = ''
-        if data:
-            rtmp_live = data['rtmp_live']
-            url = data['rtmp_url'] + '/' + rtmp_live
-            key = re.search(r'(\d{1,8}[0-9a-zA-Z]+)_?\d{0,4}p?(.m3u8|/playlist)', rtmp_live).group(1)
-        return error, key, url
+    def _get_encryption(self):
+        r = self.s.get(self.URL_ENCRYPTION, params={'did': self.DID}, timeout=30)
+        try:
+            # 用服务器 Date 头当时间戳，避免本机时钟偏差导致 auth 校验失败
+            ts = int(parsedate_to_datetime(r.headers.get('date', '')).timestamp())
+        except (TypeError, ValueError, OverflowError):
+            ts = int(time.time())
+        j = r.json()
+        if j.get('error') != 0 or not j.get('data'):
+            raise Exception('获取加密参数失败: {}'.format(j.get('error')))
+        return ts, j['data']
 
-    def get_js(self):
-        result = re.search(r'(function ub98484234.*)\s(var.*)', self.res).group()
-        func_ub9 = re.sub(r'eval.*;}', 'strc;}', result)
-        if use_quickjs:
-            js_func = quickjs.Function('ub98484234', func_ub9)
-            res = js_func()
-        else:
-            js = execjs.compile(func_ub9)
-            res = js.call('ub98484234')
+    def _compute_auth(self, ts, enc):
+        suffix = '' if enc['is_special'] == 1 else '{}{}'.format(self.rid, ts)
+        f = enc['rand_str']
+        for _ in range(enc['enc_time']):
+            f = self._md5(f + enc['key'])
+        return self._md5(f + enc['key'] + suffix)
 
-        v = re.search(r'v=(\d+)', res).group(1)
-        t10 = str(int(time.time()))
-        rb = DouYu.md5(self.rid + self.did + t10 + v)
+    def _play(self, rate, ts, enc):
+        """rate: 0=原画(最高) 8=蓝光8M 4=蓝光4M 3=超清 2=高清 1=流畅"""
+        resp = self.s.post(
+            self.URL_PLAY.format(self.rid),
+            data={
+                'enc_data': enc['enc_data'],
+                'tt': str(ts),
+                'did': self.DID,
+                'auth': self._compute_auth(ts, enc),
+                'cdn': '',
+                'rate': str(rate),
+                'hevc': self.hevc,
+                'fa': '0',
+                'ive': '0',
+            },
+            headers={'Content-Type': 'application/x-www-form-urlencoded'},
+            timeout=30,
+        ).json()
+        if resp.get('error') != 0 or not resp.get('data'):
+            return None
+        return resp['data']
 
-        func_sign = re.sub(r'return rt;}\);?', 'return rt;}', res)
-        func_sign = func_sign.replace('(function (', 'function sign(')
-        func_sign = func_sign.replace('CryptoJS.MD5(cb).toString()', '"' + rb + '"')
+    @staticmethod
+    def _url(data):
+        return data['rtmp_url'] + '/' + data['rtmp_live']
 
-        if use_quickjs:
-            js_func = quickjs.Function('sign', func_sign)
-            params = js_func(self.rid, self.did, t10)
-        else:
-            js = execjs.compile(func_sign)
-            params = js.call('sign', self.rid, self.did, t10)
-
-        params += '&ver=219032101&rid={}&rate=-1'.format(self.rid)
-
-        url = 'https://m.douyu.com/api/room/ratestream'
-        res = self.s.post(url, params=params, timeout=30).json()['data']
-        key = re.search(r'(\d{1,8}[0-9a-zA-Z]+)_?\d{0,4}p?(.m3u8|/playlist)', res['url']).group(1)
-
-        return key, res['url']
-
-    def get_pc_js(self, cdn='ws-h5', rate=0):
-        """
-        通过PC网页端的接口获取完整直播源。
-        :param cdn: 主线路ws-h5、备用线路tct-h5
-        :param rate: 1流畅；2高清；3超清；4蓝光4M；0蓝光8M或10M
-        :return: JSON格式
-        """
-        res = self.s.get('https://www.douyu.com/' + str(self.rid), timeout=30).text
-        result = re.search(r'(vdwdae325w_64we[\s\S]*function ub98484234[\s\S]*?)function', res).group(1)
-        func_ub9 = re.sub(r'eval.*?;}', 'strc;}', result)
-        if use_quickjs:
-            js_func = quickjs.Function('ub98484234', func_ub9)
-            res = js_func()
-        else:
-            js = execjs.compile(func_ub9)
-            res = js.call('ub98484234')
-
-        v = re.search(r'v=(\d+)', res).group(1)
-        t10 = str(int(time.time()))
-        rb = DouYu.md5(self.rid + self.did + t10 + v)
-
-        func_sign = re.sub(r'return rt;}\);?', 'return rt;}', res)
-        func_sign = func_sign.replace('(function (', 'function sign(')
-        func_sign = func_sign.replace('CryptoJS.MD5(cb).toString()', '"' + rb + '"')
-
-        if use_quickjs:
-            js_func = quickjs.Function('sign', func_sign)
-            params = js_func(self.rid, self.did, t10)
-        else:
-            js = execjs.compile(func_sign)
-            params = js.call('sign', self.rid, self.did, t10)
-
-        params += '&cdn={}&rate={}'.format(cdn, rate)
-        url = 'https://www.douyu.com/lapi/live/getH5Play/{}'.format(self.rid)
-        res = self.s.post(url, params=params, timeout=30).json()['data']
-
-        return res['rtmp_url'] + '/' + res['rtmp_live']
-
+    # ---------- 对外接口 ----------
     def get_real_url(self):
+        """返回 {清晰度名称/码率: 播放地址}，'flv' 为当前可得的最高画质。"""
+        ts, enc = self._get_encryption()
+        top = self._play(0, ts, enc)  # rate=0 即网页上的「原画」
+        if not top:
+            raise Exception('房间未开播或接口无数据')
+
         ret = {}
-        error, key, url = self.get_pre()
-        if error == 0:
-            ret['900p'] = url
-        elif error == 102:
-            raise Exception('房间不存在')
-        elif error == 104:
-            raise Exception('房间未开播')
-        key, url = self.get_js()
-        ret['2000p'] = url
-        #ret['flv'] = "http://openhls-tct.douyucdn2.cn/live/{}.flv?uuid=".format(key)
+        top_url = self._url(top)
+        ret['flv'] = top_url
+        ret['source'] = top_url
+
+        for item in top.get('multirates', []):
+            rate = item.get('rate', 0)
+            bit = item.get('bit') or 0
+            name = item.get('name', '')
+            data = top if rate == 0 else self._play(rate, ts, enc)
+            if not data:
+                continue
+            url = self._url(data)
+            for key in (name, str(bit) if bit else '', '{}p'.format(bit) if bit else ''):
+                if key:
+                    ret[key] = url
+            # 兼容原仓库的旧键名
+            if name == '超清':
+                ret.setdefault('2000p', url)
+            if name == '高清':
+                ret.setdefault('900p', url)
+            if name.startswith('原画'):
+                ret['flv'] = url
         return ret
 
 
 if __name__ == '__main__':
-    r = input('输入斗鱼直播间号：\n')
-    s = DouYu(r)
-    print(s.get_real_url())
+    import sys
+    r = input('输入斗鱼直播间号：\n') if len(sys.argv) < 2 else sys.argv[1]
+    urls = DouYu(r).get_real_url()
+    for k, v in urls.items():
+        print('{:16} {}'.format(k, v))

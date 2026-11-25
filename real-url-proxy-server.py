@@ -22,8 +22,10 @@ import argparse
 from datetime import datetime
 from time import sleep
 from douyu import DouYu
+import douyu
 from huya import huya
 from bilibili import BiliBili
+import bilibili
 from youtube import youtube
 import requests
 import re
@@ -179,17 +181,33 @@ class HuYaRealUrlExtractor(RealUrlExtractor):
 
 
 class DouYuRealUrlExtractor(RealUrlExtractor):
+    # 斗鱼新接口（getH5PlayV1）返回的播放地址带 token，约 300 秒就过期，
+    # 所以不管 -r 设多大，这里都要定时重取。
+    URL_TTL = 240
+
+    def __init__(self, room, auto_refresh_interval, cookie_file=None):
+        super().__init__(room, auto_refresh_interval)
+        self.cookie_file = cookie_file
+        self.last_extract_time = datetime.min
+
     def _extract_real_url(self):
         try:
+            if self.cookie_file:
+                douyu.DOUYU_COOKIE_FILE = self.cookie_file
             self.real_url = DouYu(self.room).get_real_url()
         except:
             self.real_url = 'None'
+        self.last_extract_time = datetime.now()
         super()._extract_real_url()
 
     def _is_url_valid(self, url):
         return url is not None and url != 'None'
 
     def get_real_url(self, bit_rate):
+        # 地址过期就强制重取（douyu.get_real_url 每次都会重新读 cookie 文件，
+        # 所以更新 douyu_cookie.txt 后不需要重启服务器）
+        if (datetime.now() - self.last_extract_time).total_seconds() > self.URL_TTL:
+            self.real_url = None
         super().get_real_url(bit_rate)
 
         if bit_rate == 'refresh':
@@ -208,17 +226,30 @@ class DouYuRealUrlExtractor(RealUrlExtractor):
             return self.real_url[bit_rate]
 
 class BilibiliRealUrlExtractor(RealUrlExtractor):
+    URL_TTL = 300   # B站地址带 expires，过期后要重取
+
+    def __init__(self, room, auto_refresh_interval, cookie_file=None):
+        super().__init__(room, auto_refresh_interval)
+        self.cookie_file = cookie_file
+        self.last_extract_time = datetime.min
+
     def _extract_real_url(self):
         try:
+            if self.cookie_file:
+                bilibili.BILIBILI_COOKIE_FILE = self.cookie_file
             self.real_url = BiliBili(self.room).get_real_url()
         except:
             self.real_url = 'None'
+        self.last_extract_time = datetime.now()
         super()._extract_real_url()
 
     def _is_url_valid(self, url):
         return url is not None and len(url) > 0
 
     def get_real_url(self, bit_rate):
+        # 地址过期就强制重取（每次都会重新读 cookie 文件，换 cookie 不用重启）
+        if (datetime.now() - self.last_extract_time).total_seconds() > self.URL_TTL:
+            self.real_url = None
         super().get_real_url(bit_rate)
 
         if bit_rate == 'refresh':
@@ -226,7 +257,9 @@ class BilibiliRealUrlExtractor(RealUrlExtractor):
 
         if not self._is_url_valid(self.real_url):
             return None
-        return list(self.real_url.values())[0]
+        if not bit_rate:
+            return self.real_url.get('flv') or list(self.real_url.values())[0]
+        return self.real_url.get(bit_rate) or self.real_url.get('flv')
 
 class YoutubeRealUrlExtractor(RealUrlExtractor):
     def __init__(self, room, auto_refresh_interval, cookie_file):
@@ -254,10 +287,13 @@ class YoutubeRealUrlExtractor(RealUrlExtractor):
         return self.real_url[0]
 
 class RealUrlRequestHandler(SimpleHTTPRequestHandler):
-    def __init__(self, *args, processor_maps, auto_refresh_interval, youtube_cookie_file, **kwargs):
+    def __init__(self, *args, processor_maps, auto_refresh_interval, youtube_cookie_file,
+                 douyu_cookie_file=None, bilibili_cookie_file=None, **kwargs):
         self.processor_maps = processor_maps
         self.auto_refresh_interval = auto_refresh_interval
         self.youtube_cookie_file = youtube_cookie_file
+        self.douyu_cookie_file = douyu_cookie_file
+        self.bilibili_cookie_file = bilibili_cookie_file
         super().__init__(*args, **kwargs)
 
     def _send_cors_headers(self):
@@ -266,7 +302,7 @@ class RealUrlRequestHandler(SimpleHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Headers', 'Content-Type, Content-Length, Authorization')
 
     def do_GET(self):
-        s = self.path[1:].split('/')
+        s = self.path[1:].split('?')[0].split('/')
         if len(s) >= 2:
             provider = s[0]
             room = s[1]
@@ -283,7 +319,7 @@ class RealUrlRequestHandler(SimpleHTTPRequestHandler):
 
                 try:
                     if room not in douyu_processor_map.keys():
-                        douyu_processor_map[room] = DouYuRealUrlExtractor(room, self.auto_refresh_interval)
+                        douyu_processor_map[room] = DouYuRealUrlExtractor(room, self.auto_refresh_interval, self.douyu_cookie_file)
 
                     real_url = douyu_processor_map[room].get_real_url(bit_rate)
                     if real_url is not None:
@@ -301,7 +337,7 @@ class RealUrlRequestHandler(SimpleHTTPRequestHandler):
 
                 try:
                     if room not in bilibili_processor_map.keys():
-                        bilibili_processor_map[room] = BilibiliRealUrlExtractor(room, self.auto_refresh_interval)
+                        bilibili_processor_map[room] = BilibiliRealUrlExtractor(room, self.auto_refresh_interval, self.bilibili_cookie_file)
 
                     real_url = bilibili_processor_map[room].get_real_url(bit_rate)
                     if real_url is not None:
@@ -391,13 +427,39 @@ if __name__ == '__main__':
     parser.add_argument('-p', '--port', type=int, required=True, help='Binding port of HTTP server.')
     parser.add_argument('-r', '--refresh', type=int, default=7200, help='Auto refresh interval in seconds, 0 means disable auto refresh.')
     parser.add_argument('-k', '--youtube_cookie_file', type=str, default=None, help='Cookie file for youtube.')
+    parser.add_argument('-c', '--douyu_cookie_file', type=str, default=None,
+                        help='斗鱼登录 Cookie 文件（用 douyu_cookie.py 生成）；'
+                             '不指定时默认读 douyu.py 同目录下的 douyu_cookie.txt。')
+    parser.add_argument('-b', '--bilibili_cookie_file', type=str, default=None,
+                        help='B站登录 Cookie 文件（用 bilibili_cookie.py 生成）；'
+                             '不指定时默认读 bilibili.py 同目录下的 bilibili_cookie.txt。')
     parser.add_argument('-l', '--log', type=str, default=None, help='Log file path name.')
     args = parser.parse_args()
 
     log = Logger(args.log)
 
+    # 启动时提示斗鱼登录态：有 acf_* 才是登录态，才能拿到原画（1080P60）
+    ck_path = args.douyu_cookie_file or douyu.DOUYU_COOKIE_FILE
+    ck = douyu.resolve_cookie(args.douyu_cookie_file)
+    if ck:
+        ck_keys = [k for k in ('acf_uid', 'acf_stk', 'acf_auth', 'dy_auth') if k in ck]
+        log.logger.info('douyu cookie 已加载（%s）: %s',
+                        ', '.join(ck_keys) if ck_keys else '无登录凭证，画质会被降到 4000kbps', ck_path)
+    else:
+        log.logger.warning('douyu cookie 未找到（%s）；未登录只能拿到 4000kbps，'
+                           '运行 python3 douyu_cookie.py --wechat 获取', ck_path)
+
+    bk_path = args.bilibili_cookie_file or bilibili.BILIBILI_COOKIE_FILE
+    bk = bilibili.resolve_cookie(args.bilibili_cookie_file)
+    if 'SESSDATA' in bk:
+        log.logger.info('bilibili cookie 已加载（SESSDATA）: %s', bk_path)
+    else:
+        log.logger.warning('bilibili cookie 未加载（%s）；未登录只能拿到 250（超清 720p），'
+                           '运行 python3 bilibili_cookie.py --qrcode 扫码', bk_path)
+
     processor_maps = {}
-    HandlerClass = functools.partial(RealUrlRequestHandler, processor_maps=processor_maps, auto_refresh_interval=args.refresh, youtube_cookie_file=args.youtube_cookie_file)
+    HandlerClass = functools.partial(RealUrlRequestHandler, processor_maps=processor_maps, auto_refresh_interval=args.refresh, youtube_cookie_file=args.youtube_cookie_file, douyu_cookie_file=args.douyu_cookie_file,
+                                 bilibili_cookie_file=args.bilibili_cookie_file)
     ServerClass  = ThreadingHTTPServer
     #Protocol     = "HTTP/1.0"
 
